@@ -1,4 +1,8 @@
 <!-- markdownlint-disable MD001 MD041 -->
+<h1 align="center">
+WARNING - THIS IS A LOCAL COPY OF vLLM - See Below for Official Supported Repo
+</h1>
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
