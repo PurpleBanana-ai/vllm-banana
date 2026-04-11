@@ -5,6 +5,7 @@ from typing import Any, Literal, get_args
 
 from vllm.config.utils import config
 from vllm.logger import init_logger
+from vllm.tasks import PoolingTask
 from vllm.utils.hashing import safe_hash
 
 logger = init_logger(__name__)
@@ -19,6 +20,11 @@ TOK_POOLING_TYPES: tuple[TokenPoolingType, ...] = get_args(TokenPoolingType)
 @config
 class PoolerConfig:
     """Controls the behavior of output pooling in pooling models."""
+
+    task: PoolingTask | None = None
+    """
+    The task used for pooling.
+    """
 
     pooling_type: SequencePoolingType | TokenPoolingType | None = None
     """
@@ -75,6 +81,13 @@ class PoolerConfig:
     logit_bias: float | None = None
     """
     If provided, apply classification logit biases. Defaults to None.
+    """
+
+    logit_scale: float | None = None
+    """
+    If provided, scale the classification logits by this factor before
+    activation. Combined with logit_bias, enables affine score calibration:
+    activation(logit_scale * (score - logit_bias)). Defaults to None.
     """
 
     ## for reward models
