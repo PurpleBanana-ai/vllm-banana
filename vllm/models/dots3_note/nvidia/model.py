@@ -19,6 +19,8 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.attention import MLAAttention
+from vllm.model_executor.layers.fused_embed_norm import has_full_vocab_on_rank
+from vllm.model_executor.layers.fused_moe import RoutedScaleMode
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -43,6 +45,7 @@ from vllm.model_executor.models.utils import (
     PPMissingLayer,
     make_empty_intermediate_tensors_factory,
     make_layers,
+    pp_topk_buffers,
     sequence_parallel_chunk,
 )
 from vllm.models.deepseek_v32.nvidia.model import (
@@ -51,7 +54,7 @@ from vllm.models.deepseek_v32.nvidia.model import (
     DeepseekV32Model,
 )
 from vllm.platforms import current_platform
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.kv_cache_interface import KVCacheLayerConfig, MLAAttentionSpec
 
 from .attention import (
     Dots3NoteFlashAttnPrefillBackend,
@@ -73,6 +76,28 @@ def _padded_mlp_size(
     return ((blocks + tp_size - 1) // tp_size) * block_size[0] * tp_size
 
 
+def _pad_dense_mlp_weight(
+    name: str,
+    loaded_weight: torch.Tensor,
+    weight_block_size: list[int] | None,
+) -> torch.Tensor:
+    if weight_block_size is None or ".mlp.experts." in name:
+        return loaded_weight
+    if not any(
+        proj_name in name for proj_name in (".gate_proj.", ".up_proj.", ".down_proj.")
+    ):
+        return loaded_weight
+    dim = 1 if ".down_proj." in name else 0
+    block_step = 1 if name.endswith("weight_scale_inv") else weight_block_size[0]
+    multiple = get_tensor_model_parallel_world_size() * block_step
+    pad = (-loaded_weight.shape[dim]) % multiple
+    if pad == 0:
+        return loaded_weight
+    pad_shape = list(loaded_weight.shape)
+    pad_shape[dim] = pad
+    return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
+
+
 class Dots3NoteMoE(DeepseekV2MoE):
     """DeepSeek MoE with NOTE's block-padded shared expert."""
 
@@ -83,7 +108,7 @@ class Dots3NoteMoE(DeepseekV2MoE):
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
         prefix: str = "",
-        apply_routed_scale_to_output: bool = False,
+        routed_scale_mode: RoutedScaleMode = RoutedScaleMode.ROUTER,
     ) -> None:
         num_shared_experts = config.n_shared_experts
         routed_config = copy.copy(config)
@@ -94,7 +119,7 @@ class Dots3NoteMoE(DeepseekV2MoE):
             quant_config=quant_config,
             reduce_results=False,
             prefix=prefix,
-            apply_routed_scale_to_output=apply_routed_scale_to_output,
+            routed_scale_mode=routed_scale_mode,
         )
         self.n_shared_experts = num_shared_experts
         self.reduce_results = reduce_results
@@ -210,10 +235,13 @@ class Dots3NotePaddedMLAAttention(MLAAttention):
         assert physical_head_size >= self.head_size
         self.physical_head_size = physical_head_size
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MLAAttentionSpec:
-        spec = super().get_kv_cache_spec(vllm_config)
-        assert isinstance(spec, MLAAttentionSpec)
-        return replace(spec, head_size=self.physical_head_size)
+    def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
+        layer_config = super().get_kv_cache_config(vllm_config)
+        assert isinstance(layer_config.spec, MLAAttentionSpec)
+        return replace(
+            layer_config,
+            spec=replace(layer_config.spec, head_size=self.physical_head_size),
+        )
 
 
 class Dots3NoteFullAttention(DeepseekV2MLAAttention):
@@ -524,7 +552,7 @@ class Dots3NoteDecoderLayer(DeepseekV32DecoderLayer):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=f"{prefix}.mlp",
-                apply_routed_scale_to_output=False,
+                routed_scale_mode=RoutedScaleMode.ROUTER,
             )
         else:
             self.mlp = DeepseekV2MLP(
@@ -559,7 +587,7 @@ class Dots3NoteModel(DeepseekV32Model):
         self.use_sequence_parallel = False
         self.is_v32 = True
         self._weight_block_size = getattr(quant_config, "weight_block_size", None)
-        topk_indices_buffer = torch.empty(
+        self.topk_indices_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             config.index_topk,
             dtype=torch.int32,
@@ -574,12 +602,13 @@ class Dots3NoteModel(DeepseekV32Model):
             )
         else:
             self.embed_tokens = PPMissingLayer()
+        self.replicated_embed = has_full_vocab_on_rank(self.embed_tokens)
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Dots3NoteDecoderLayer(
                 vllm_config=vllm_config,
                 prefix=prefix,
-                topk_indices_buffer=topk_indices_buffer,
+                topk_indices_buffer=self.topk_indices_buffer,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -587,34 +616,16 @@ class Dots3NoteModel(DeepseekV32Model):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        self.pp_buffers = pp_topk_buffers(
+            config, self.topk_indices_buffer, range(config.num_hidden_layers)
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
+            ["hidden_states"], config.hidden_size, self.pp_buffers
         )
         self.aux_hidden_state_layers = tuple[int, ...]()
         self.num_redundant_experts = (
             vllm_config.parallel_config.eplb_config.num_redundant_experts
         )
-
-    def _pad_dense_mlp_weight(
-        self, name: str, loaded_weight: torch.Tensor
-    ) -> torch.Tensor:
-        block_size = self._weight_block_size
-        if block_size is None or ".mlp.experts." in name:
-            return loaded_weight
-        if not any(
-            proj_name in name
-            for proj_name in (".gate_proj.", ".up_proj.", ".down_proj.")
-        ):
-            return loaded_weight
-        dim = 1 if ".down_proj." in name else 0
-        block_step = 1 if name.endswith("weight_scale_inv") else block_size[0]
-        multiple = get_tensor_model_parallel_world_size() * block_step
-        pad = (-loaded_weight.shape[dim]) % multiple
-        if pad == 0:
-            return loaded_weight
-        pad_shape = list(loaded_weight.shape)
-        pad_shape[dim] = pad
-        return torch.cat([loaded_weight, loaded_weight.new_zeros(pad_shape)], dim=dim)
 
     def _adapt_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -667,12 +678,7 @@ class Dots3NoteModel(DeepseekV32Model):
                     )
                     yield f"{layer_prefix}.{projection}.weight", dequantized
                     continue
-            yield name, self._pad_dense_mlp_weight(name, weight)
-        if pending_indexer_fp8:
-            missing = ", ".join(
-                f"{prefix}.{proj}" for prefix, proj in pending_indexer_fp8
-            )
-            raise ValueError(f"Incomplete FP8 indexer weights: {missing}")
+            yield name, _pad_dense_mlp_weight(name, weight, self._weight_block_size)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         return super().load_weights(self._adapt_weights(weights))
